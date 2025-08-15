@@ -55,160 +55,236 @@ module challenge
 
     // Constants
     localparam [FLEN-1:0] CONST_0_3 = 64'h3FD3333333333333; // 0.3 in double precision
-    
-    // Overall pipeline control
-    logic pipeline_advance;
-    assign pipeline_advance = res_rdy | ~res_vld;
-    assign arg_rdy = pipeline_advance;  // Can always accept new inputs
-    
-    // 21-stage pipeline (to handle the full computation latency)
-    logic [20:0] stage_vld;
-    logic [FLEN-1:0] a_pipe [0:20];
-    logic [FLEN-1:0] b_pipe [0:20];
-    logic [FLEN-1:0] c_pipe [0:20];
-    
-    // Intermediate results storage
-    logic [FLEN-1:0] a2_result, a3_result, a4_result, a5_result;
-    logic [FLEN-1:0] b_scaled_result, sum_result;
-    logic [FLEN-1:0] a2_pipe [0:20];
-    logic [FLEN-1:0] b_scaled_pipe [0:20];
-    
-    // Arithmetic module outputs
-    logic [FLEN-1:0] mult1_res, mult2_res, mult3_res, mult4_res;
-    logic [FLEN-1:0] scale_res, add_res, sub_res;
-    logic mult1_down, mult2_down, mult3_down, mult4_down;
-    logic scale_down, add_down, sub_down;
-    
+
+    // Pipeline enable - can advance when output is ready or no output yet
+    logic pipe_enable;
+    assign pipe_enable = res_rdy | ~res_vld;
+    assign arg_rdy = pipe_enable;
+
+    // Main pipeline - 18 stages to handle full computation latency
+    logic [17:0] stage_valid;
+    logic [FLEN-1:0] a_pipe [0:17];
+    logic [FLEN-1:0] b_pipe [0:17]; 
+    logic [FLEN-1:0] c_pipe [0:17];
+
     // Pipeline advancement
     always_ff @(posedge clk) begin
         if (rst) begin
-            stage_vld <= 21'b0;
-        end else if (pipeline_advance) begin
-            stage_vld[20:1] <= stage_vld[19:0];
-            stage_vld[0] <= arg_vld;
+            stage_valid <= 18'b0;
+        end else if (pipe_enable) begin
+            stage_valid[17:1] <= stage_valid[16:0];
+            stage_valid[0] <= arg_vld;
         end
     end
-    
-    // Data pipeline
+
+    // Data pipeline registers
     always_ff @(posedge clk) begin
-        if (pipeline_advance) begin
-            // Input stage
+        if (pipe_enable) begin
             a_pipe[0] <= a;
             b_pipe[0] <= b;
             c_pipe[0] <= c;
             
-            // Shift pipeline data
-            for (int i = 1; i <= 20; i++) begin
+            for (int i = 1; i < 18; i++) begin
                 a_pipe[i] <= a_pipe[i-1];
                 b_pipe[i] <= b_pipe[i-1];
                 c_pipe[i] <= c_pipe[i-1];
             end
+        end
+    end
+
+    // Arithmetic operations
+    // Note: Each f_mult/f_add/f_sub takes 3 cycles from up_valid to down_valid
+
+    // Stage 0-2: Compute a*a (a^2) and 0.3*b in parallel
+    logic [FLEN-1:0] a2_result, b_scaled_result;
+    logic a2_down_valid, b_scaled_down_valid;
+
+    f_mult mult_a2 (
+        .clk(clk), .rst(rst),
+        .a(a_pipe[0]), .b(a_pipe[0]),
+        .up_valid(stage_valid[0]),
+        .res(a2_result), .down_valid(a2_down_valid),
+        .busy(), .error()
+    );
+
+    f_mult mult_scale (
+        .clk(clk), .rst(rst),
+        .a(CONST_0_3), .b(b_pipe[0]),
+        .up_valid(stage_valid[0]),
+        .res(b_scaled_result), .down_valid(b_scaled_down_valid),
+        .busy(), .error()
+    );
+
+    // Pipeline registers to store a^2 and b_scaled results
+    logic [FLEN-1:0] a2_pipe [0:15];  // Need to pipeline a^2 forward
+    logic [FLEN-1:0] b_scaled_pipe [0:15];  // Need to pipeline b_scaled forward
+    logic [14:0] a2_valid_pipe, b_scaled_valid_pipe;
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            a2_valid_pipe <= 15'b0;
+            b_scaled_valid_pipe <= 15'b0;
+        end else if (pipe_enable) begin
+            a2_valid_pipe[14:1] <= a2_valid_pipe[13:0];
+            a2_valid_pipe[0] <= a2_down_valid;
             
-            // Capture and shift intermediate results
-            if (mult1_down) begin
-                a2_result <= mult1_res;
-            end
-            a2_pipe[0] <= a2_result;
-            for (int i = 1; i <= 20; i++) begin
+            b_scaled_valid_pipe[14:1] <= b_scaled_valid_pipe[13:0];
+            b_scaled_valid_pipe[0] <= b_scaled_down_valid;
+            
+            if (a2_down_valid) a2_pipe[0] <= a2_result;
+            if (b_scaled_down_valid) b_scaled_pipe[0] <= b_scaled_result;
+            
+            for (int i = 1; i < 15; i++) begin
                 a2_pipe[i] <= a2_pipe[i-1];
-            end
-            
-            if (scale_down) begin
-                b_scaled_result <= scale_res;
-            end
-            b_scaled_pipe[0] <= b_scaled_result;
-            for (int i = 1; i <= 20; i++) begin
                 b_scaled_pipe[i] <= b_scaled_pipe[i-1];
-            end
-            
-            if (mult2_down) begin
-                a3_result <= mult2_res;
-            end
-            if (mult3_down) begin
-                a4_result <= mult3_res;
-            end
-            if (mult4_down) begin
-                a5_result <= mult4_res;
-            end
-            if (add_down) begin
-                sum_result <= add_res;
             end
         end
     end
-    
-    // Arithmetic modules
-    
-    // Stage 1: a * a = a^2 (starts at cycle 0, result at cycle 3)
-    f_mult mult1 (
-        .clk(clk), .rst(rst),
-        .a(a_pipe[0]), .b(a_pipe[0]),
-        .up_valid(stage_vld[0]),
-        .res(mult1_res), .down_valid(mult1_down),
-        .busy(), .error()
-    );
-    
-    // Parallel: 0.3 * b (starts at cycle 0, result at cycle 3)
-    f_mult scale_mult (
-        .clk(clk), .rst(rst),
-        .a(CONST_0_3), .b(b_pipe[0]),
-        .up_valid(stage_vld[0]),
-        .res(scale_res), .down_valid(scale_down),
-        .busy(), .error()
-    );
-    
-    // Stage 2: a^2 * a = a^3 (starts at cycle 3, result at cycle 6)
-    f_mult mult2 (
+
+    // Stage 3-5: Compute a^2 * a = a^3
+    logic [FLEN-1:0] a3_result;
+    logic a3_down_valid;
+
+    f_mult mult_a3 (
         .clk(clk), .rst(rst),
         .a(a2_pipe[0]), .b(a_pipe[3]),
-        .up_valid(stage_vld[3]),
-        .res(mult2_res), .down_valid(mult2_down),
+        .up_valid(a2_valid_pipe[0] && stage_valid[3]),
+        .res(a3_result), .down_valid(a3_down_valid),
         .busy(), .error()
     );
-    
-    // Stage 3: a^3 * a = a^4 (starts at cycle 6, result at cycle 9)
-    f_mult mult3 (
+
+    // Pipeline registers for a^3
+    logic [FLEN-1:0] a3_pipe [0:11];
+    logic [11:0] a3_valid_pipe;
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            a3_valid_pipe <= 12'b0;
+        end else if (pipe_enable) begin
+            a3_valid_pipe[11:1] <= a3_valid_pipe[10:0];
+            a3_valid_pipe[0] <= a3_down_valid;
+            
+            if (a3_down_valid) a3_pipe[0] <= a3_result;
+            
+            for (int i = 1; i < 12; i++) begin
+                a3_pipe[i] <= a3_pipe[i-1];
+            end
+        end
+    end
+
+    // Stage 6-8: Compute a^3 * a = a^4  
+    logic [FLEN-1:0] a4_result;
+    logic a4_down_valid;
+
+    f_mult mult_a4 (
         .clk(clk), .rst(rst),
-        .a(a3_result), .b(a_pipe[6]),
-        .up_valid(stage_vld[6]),
-        .res(mult3_res), .down_valid(mult3_down),
+        .a(a3_pipe[0]), .b(a_pipe[6]),
+        .up_valid(a3_valid_pipe[0] && stage_valid[6]),
+        .res(a4_result), .down_valid(a4_down_valid),
         .busy(), .error()
     );
-    
-    // Stage 4: a^4 * a = a^5 (starts at cycle 9, result at cycle 12)
-    f_mult mult4 (
+
+    // Pipeline registers for a^4
+    logic [FLEN-1:0] a4_pipe [0:8];
+    logic [8:0] a4_valid_pipe;
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            a4_valid_pipe <= 9'b0;
+        end else if (pipe_enable) begin
+            a4_valid_pipe[8:1] <= a4_valid_pipe[7:0];
+            a4_valid_pipe[0] <= a4_down_valid;
+            
+            if (a4_down_valid) a4_pipe[0] <= a4_result;
+            
+            for (int i = 1; i < 9; i++) begin
+                a4_pipe[i] <= a4_pipe[i-1];
+            end
+        end
+    end
+
+    // Stage 9-11: Compute a^4 * a = a^5
+    logic [FLEN-1:0] a5_result;
+    logic a5_down_valid;
+
+    f_mult mult_a5 (
         .clk(clk), .rst(rst),
-        .a(a4_result), .b(a_pipe[9]),
-        .up_valid(stage_vld[9]),
-        .res(mult4_res), .down_valid(mult4_down),
+        .a(a4_pipe[0]), .b(a_pipe[9]),
+        .up_valid(a4_valid_pipe[0] && stage_valid[9]),
+        .res(a5_result), .down_valid(a5_down_valid),
         .busy(), .error()
     );
-    
-    // Stage 5: a^5 + 0.3*b (starts at cycle 12, result at cycle 15)
+
+    // Pipeline registers for a^5
+    logic [FLEN-1:0] a5_pipe [0:5];
+    logic [5:0] a5_valid_pipe;
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            a5_valid_pipe <= 6'b0;
+        end else if (pipe_enable) begin
+            a5_valid_pipe[5:1] <= a5_valid_pipe[4:0];
+            a5_valid_pipe[0] <= a5_down_valid;
+            
+            if (a5_down_valid) a5_pipe[0] <= a5_result;
+            
+            for (int i = 1; i < 6; i++) begin
+                a5_pipe[i] <= a5_pipe[i-1];
+            end
+        end
+    end
+
+    // Stage 12-14: Compute a^5 + 0.3*b
+    logic [FLEN-1:0] sum_result;
+    logic sum_down_valid;
+
     f_add adder (
         .clk(clk), .rst(rst),
-        .a(a5_result), .b(b_scaled_pipe[9]),  // b_scaled from 9 cycles ago
-        .up_valid(stage_vld[12]),
-        .res(add_res), .down_valid(add_down),
+        .a(a5_pipe[0]), .b(b_scaled_pipe[9]),  // b_scaled from 9 stages earlier
+        .up_valid(a5_valid_pipe[0] && b_scaled_valid_pipe[9] && stage_valid[12]),
+        .res(sum_result), .down_valid(sum_down_valid),
         .busy(), .error()
     );
-    
-    // Stage 6: result - c (starts at cycle 15, result at cycle 18)
+
+    // Pipeline registers for sum
+    logic [FLEN-1:0] sum_pipe [0:2];
+    logic [2:0] sum_valid_pipe;
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            sum_valid_pipe <= 3'b0;
+        end else if (pipe_enable) begin
+            sum_valid_pipe[2:1] <= sum_valid_pipe[1:0];
+            sum_valid_pipe[0] <= sum_down_valid;
+            
+            if (sum_down_valid) sum_pipe[0] <= sum_result;
+            
+            for (int i = 1; i < 3; i++) begin
+                sum_pipe[i] <= sum_pipe[i-1];
+            end
+        end
+    end
+
+    // Stage 15-17: Compute (a^5 + 0.3*b) - c
+    logic [FLEN-1:0] final_result;
+    logic final_down_valid;
+
     f_sub subtractor (
         .clk(clk), .rst(rst),
-        .a(sum_result), .b(c_pipe[15]),
-        .up_valid(stage_vld[15]),
-        .res(sub_res), .down_valid(sub_down),
+        .a(sum_pipe[0]), .b(c_pipe[15]),
+        .up_valid(sum_valid_pipe[0] && stage_valid[15]),
+        .res(final_result), .down_valid(final_down_valid),
         .busy(), .error()
     );
-    
-    // Output
+
+    // Output stage
     always_ff @(posedge clk) begin
         if (rst) begin
             res_vld <= 1'b0;
-        end else if (pipeline_advance) begin
-            res_vld <= stage_vld[18];
-            if (sub_down) begin
-                res <= sub_res;
+        end else if (pipe_enable) begin
+            res_vld <= final_down_valid;
+            if (final_down_valid) begin
+                res <= final_result;
             end
         end
     end
